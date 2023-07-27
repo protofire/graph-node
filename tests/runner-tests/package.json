@@ -10,6 +10,7 @@
     "derived-loaders",
     "block-handlers",
     "typename",
-    "arweave-file-data-sources"
+    "arweave-file-data-sources",
+    "end-block"
   ]
 }
