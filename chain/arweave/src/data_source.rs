@@ -47,7 +47,6 @@ impl blockchain::DataSource<Chain> for DataSource {
         self.source.start_block
     }
 
-
     fn end_block(&self) -> Option<BlockNumber> {
         self.source.end_block
     }
