@@ -36,7 +36,7 @@ impl<Q> GraphQLServer<Q> {
             "GraphQLServer",
             Some(ComponentLoggerConfig {
                 elastic: Some(ElasticComponentLoggerConfig {
-                    index: get_index("graphql-server-logs"),
+                    index: get_index("graphql-server-logs-protofire"),
                 }),
             }),
         );

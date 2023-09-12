@@ -468,7 +468,7 @@ impl Blockchain for Chain {
                         "EthereumPollingBlockIngestor",
                         Some(ComponentLoggerConfig {
                             elastic: Some(ElasticComponentLoggerConfig {
-                                index: get_index("block-ingestor-logs"),
+                                index: get_index("block-ingestor-logs-protofire"),
                             }),
                         }),
                     )

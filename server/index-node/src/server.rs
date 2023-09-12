@@ -47,7 +47,7 @@ impl<Q, S> IndexNodeServer<Q, S> {
             "IndexNodeServer",
             Some(ComponentLoggerConfig {
                 elastic: Some(ElasticComponentLoggerConfig {
-                    index: get_index("index-node-server-logs"),
+                    index: get_index("index-node-server-logs-protofire"),
                 }),
             }),
         );

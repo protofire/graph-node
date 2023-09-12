@@ -109,7 +109,7 @@ impl LoggerFactory {
                     elastic_logger(
                         ElasticDrainConfig {
                             general: elastic_config,
-                            index: get_index("subgraph-logs"),
+                            index: get_index("subgraph-logs-protofire"),
                             document_type: String::from("log"),
                             custom_id_key: String::from("subgraphId"),
                             custom_id_value: loc.hash.to_string(),
