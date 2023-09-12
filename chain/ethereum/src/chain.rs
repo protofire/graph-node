@@ -53,6 +53,13 @@ use crate::{
     SubgraphEthRpcMetrics, TriggerFilter, ENV_VARS,
 };
 use graph::blockchain::block_stream::{BlockStream, BlockStreamBuilder, FirehoseCursor};
+use chrono::{Datelike, Timelike};
+
+/// Custom function made by Protofire for getting index in format <index_name>-dd.mm.yyyy
+pub fn get_index(index_name: &str) -> String {
+    let now = chrono::Utc::now();
+    return String::from(format!("{}-{}.{}.{}", index_name, now.year(), now.month(), now.day()));
+}
 
 /// Celo Mainnet: 42220, Testnet Alfajores: 44787, Testnet Baklava: 62320
 const CELO_CHAIN_IDS: [u64; 3] = [42220, 44787, 62320];
@@ -461,7 +468,7 @@ impl Blockchain for Chain {
                         "EthereumPollingBlockIngestor",
                         Some(ComponentLoggerConfig {
                             elastic: Some(ElasticComponentLoggerConfig {
-                                index: String::from("block-ingestor-logs"),
+                                index: get_index("block-ingestor-logs"),
                             }),
                         }),
                     )
