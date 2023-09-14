@@ -18,7 +18,6 @@ anyhow = "1.0"
 tiny-keccak = "1.5.0"
 hex = "0.4.3"
 semver = "1.0.18"
-chrono = "0.4.25"
 
 itertools = "0.11.0"
 

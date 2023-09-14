@@ -11,7 +11,6 @@ hyper = "0.14"
 serde = "1.0"
 graph = { path = "../../graph" }
 graph-graphql = { path = "../../graphql" }
-chrono = "0.4.25"
 
 [dev-dependencies]
 graph-core = { path = "../../core" }

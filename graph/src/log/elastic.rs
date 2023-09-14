@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::prelude::{SecondsFormat, Utc};
+use chrono::{Datelike, Timelike};
 use futures03::TryFutureExt;
 use http::header::CONTENT_TYPE;
 use prometheus::Counter;
@@ -180,6 +181,11 @@ pub struct ElasticDrain {
     logs: Arc<Mutex<Vec<ElasticLog>>>,
 }
 
+pub fn get_index(index_name: &String) -> String {
+    let now = chrono::Utc::now();
+    return String::from(format!("{}-{}.{}.{}", index_name, now.year(), now.month(), now.day()));
+}
+
 impl ElasticDrain {
     /// Creates a new `ElasticDrain`.
     pub fn new(
@@ -244,7 +250,7 @@ impl ElasticDrain {
                             // Serialize the action line to a string
                             let action_line = json!({
                                 "index": {
-                                    "_index": config.index,
+                                    "_index": get_index(&config.index),
                                     "_type": config.document_type,
                                     "_id": log.id,
                                 }

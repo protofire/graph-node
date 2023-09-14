@@ -7,13 +7,6 @@ use thiserror::Error;
 
 use crate::service::GraphQLService;
 use graph::prelude::{GraphQLServer as GraphQLServerTrait, GraphQlRunner, *};
-use chrono::{Datelike, Timelike};
-
-/// Custom function made by Protofire for getting index in format <index_name>-dd.mm.yyyy
-pub fn get_index(index_name: &str) -> String {
-    let now = chrono::Utc::now();
-    return String::from(format!("{}-{}.{}.{}", index_name, now.year(), now.month(), now.day()));
-}
 
 /// Errors that may occur when starting the server.
 #[derive(Debug, Error)]
@@ -36,7 +29,7 @@ impl<Q> GraphQLServer<Q> {
             "GraphQLServer",
             Some(ComponentLoggerConfig {
                 elastic: Some(ElasticComponentLoggerConfig {
-                    index: get_index("graphql-server-logs-protofire"),
+                    index: String::from("graphql-server-logs-protofire"),
                 }),
             }),
         );

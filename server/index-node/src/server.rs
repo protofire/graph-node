@@ -10,13 +10,6 @@ use graph::{
 
 use crate::service::IndexNodeService;
 use thiserror::Error;
-use chrono::{Datelike, Timelike};
-
-/// Custom function made by Protofire for getting index in format <index_name>-dd.mm.yyyy
-pub fn get_index(index_name: &str) -> String {
-    let now = chrono::Utc::now();
-    return String::from(format!("{}-{}.{}.{}", index_name, now.year(), now.month(), now.day()));
-}
 
 /// Errors that may occur when starting the server.
 #[derive(Debug, Error)]
@@ -47,7 +40,7 @@ impl<Q, S> IndexNodeServer<Q, S> {
             "IndexNodeServer",
             Some(ComponentLoggerConfig {
                 elastic: Some(ElasticComponentLoggerConfig {
-                    index: get_index("index-node-server-logs-protofire"),
+                    index: String::from("index-node-server-logs-protofire"),
                 }),
             }),
         );

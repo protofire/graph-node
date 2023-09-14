@@ -8,13 +8,6 @@ use crate::components::store::DeploymentLocator;
 use crate::log::elastic::*;
 use crate::log::split::*;
 use crate::prelude::ENV_VARS;
-use chrono::{Datelike, Timelike};
-
-/// Custom function made by Protofire for getting index in format <index_name>-dd.mm.yyyy
-pub fn get_index(index_name: &str) -> String {
-    let now = chrono::Utc::now();
-    return String::from(format!("{}-{}.{}.{}", index_name, now.year(), now.month(), now.day()));
-}
 
 /// Configuration for component-specific logging to Elasticsearch.
 pub struct ElasticComponentLoggerConfig {
@@ -109,7 +102,7 @@ impl LoggerFactory {
                     elastic_logger(
                         ElasticDrainConfig {
                             general: elastic_config,
-                            index: get_index("subgraph-logs-protofire"),
+                            index: String::from("subgraph-logs-protofire"),
                             document_type: String::from("log"),
                             custom_id_key: String::from("subgraphId"),
                             custom_id_value: loc.hash.to_string(),
