@@ -507,6 +507,7 @@ pub struct DeploymentFeatures {
     pub features: Vec<String>,
     pub data_source_kinds: Vec<String>,
     pub network: String,
+    pub handler_kinds: Vec<String>,
 }
 
 impl IntoValue for DeploymentFeatures {
@@ -517,6 +518,7 @@ impl IntoValue for DeploymentFeatures {
             apiVersion: self.api_version,
             features: self.features,
             dataSources: self.data_source_kinds,
+            handlers: self.handler_kinds,
             network: self.network,
         }
     }
@@ -695,6 +697,13 @@ impl<C: Blockchain> SubgraphManifest<C> {
             .map(|v| v.version().map(|v| v.to_string()))
             .flatten();
 
+        let handler_kinds = self
+            .data_sources
+            .iter()
+            .map(|ds| ds.handler_kinds())
+            .flatten()
+            .collect::<HashSet<_>>();
+
         let features: Vec<String> = self
             .features
             .iter()
@@ -722,7 +731,11 @@ impl<C: Blockchain> SubgraphManifest<C> {
             features,
             spec_version,
             data_source_kinds: data_source_kinds.into_iter().collect_vec(),
-            network: network,
+            handler_kinds: handler_kinds
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect_vec(),
+            network,
         }
     }
 
@@ -836,11 +849,26 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
         if spec_version < SPEC_VERSION_0_0_7
             && data_sources
                 .iter()
-                .any(|ds| OFFCHAIN_KINDS.contains(&ds.kind()))
+                .any(|ds| OFFCHAIN_KINDS.contains_key(ds.kind().as_str()))
         {
             bail!(
                 "Offchain data sources not supported prior to {}",
                 SPEC_VERSION_0_0_7
+            );
+        }
+
+        // Check the min_spec_version of each data source against the spec version of the subgraph
+        let min_spec_version_mismatch = data_sources
+            .iter()
+            .find(|ds| spec_version < ds.min_spec_version());
+
+        if let Some(min_spec_version_mismatch) = min_spec_version_mismatch {
+            bail!(
+                "Subgraph `{}` uses spec version {}, but data source `{}` requires at least version {}",
+                id,
+                spec_version,
+                min_spec_version_mismatch.name(),
+                min_spec_version_mismatch.min_spec_version()
             );
         }
 

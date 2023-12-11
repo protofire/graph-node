@@ -16,10 +16,11 @@ use graph::blockchain::{
     TriggersAdapter, TriggersAdapterSelector,
 };
 use graph::cheap_clone::CheapClone;
+use graph::components::link_resolver::{ArweaveClient, ArweaveResolver, FileSizeLimit};
 use graph::components::metrics::MetricsRegistry;
 use graph::components::store::{BlockStore, DeploymentLocator};
 use graph::components::subgraph::Settings;
-use graph::data::graphql::effort::LoadManager;
+use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::{Query, QueryTarget};
 use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth};
 use graph::env::EnvVars;
@@ -32,8 +33,9 @@ use graph::prelude::{
     SubgraphName, SubgraphRegistrar, SubgraphStore as _, SubgraphVersionSwitchingMode,
     TriggerProcessor,
 };
+use graph::schema::InputSchema;
 use graph::slog::crit;
-use graph_core::polling_monitor::ipfs_service;
+use graph_core::polling_monitor::{arweave_service, ipfs_service};
 use graph_core::{
     LinkResolver, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
     SubgraphInstanceManager, SubgraphRegistrar as IpfsSubgraphRegistrar, SubgraphTriggerProcessor,
@@ -96,6 +98,7 @@ pub struct TestContext {
     pub subgraph_name: SubgraphName,
     pub instance_manager: SubgraphInstanceManager<graph_store_postgres::SubgraphStore>,
     pub link_resolver: Arc<dyn graph::components::link_resolver::LinkResolver>,
+    pub arweave_resolver: Arc<dyn ArweaveResolver>,
     pub env_vars: Arc<EnvVars>,
     pub ipfs: IpfsClient,
     graphql_runner: Arc<GraphQlRunner>,
@@ -358,6 +361,17 @@ pub async fn setup<C: Blockchain>(
         env_vars.mappings.ipfs_timeout,
         env_vars.mappings.ipfs_request_limit,
     );
+
+    let arweave_resolver = Arc::new(ArweaveClient::default());
+    let arweave_service = arweave_service(
+        arweave_resolver.cheap_clone(),
+        env_vars.mappings.ipfs_timeout,
+        env_vars.mappings.ipfs_request_limit,
+        match env_vars.mappings.max_ipfs_file_bytes {
+            0 => FileSizeLimit::Unlimited,
+            n => FileSizeLimit::MaxBytes(n as u64),
+        },
+    );
     let sg_count = Arc::new(SubgraphCountMetric::new(mock_registry.cheap_clone()));
 
     let blockchain_map = Arc::new(blockchain_map);
@@ -370,12 +384,13 @@ pub async fn setup<C: Blockchain>(
         mock_registry.clone(),
         link_resolver.cheap_clone(),
         ipfs_service,
+        arweave_service,
         static_filters,
     );
 
     // Graphql runner
     let subscription_manager = Arc::new(PanicSubscriptionManager {});
-    let load_manager = LoadManager::new(&logger, Vec::new(), mock_registry.clone());
+    let load_manager = LoadManager::new(&logger, Vec::new(), Vec::new(), mock_registry.clone());
     let graphql_runner = Arc::new(GraphQlRunner::new(
         &logger,
         stores.network_store.clone(),
@@ -431,6 +446,8 @@ pub async fn setup<C: Blockchain>(
     .await
     .expect("failed to create subgraph version");
 
+    let arweave_resolver = Arc::new(ArweaveClient::default());
+
     TestContext {
         logger: logger_factory.subgraph_logger(&deployment),
         provider: subgraph_provider,
@@ -443,6 +460,7 @@ pub async fn setup<C: Blockchain>(
         env_vars,
         indexing_status_service,
         ipfs,
+        arweave_resolver,
     }
 }
 
@@ -563,6 +581,18 @@ impl<C: Blockchain> BlockStreamBuilder<C> for MutexBlockStreamBuilder<C> {
             .await
     }
 
+    async fn build_substreams(
+        &self,
+        _chain: &C,
+        _schema: Arc<InputSchema>,
+        _deployment: DeploymentLocator,
+        _block_cursor: FirehoseCursor,
+        _subgraph_current_block: Option<BlockPtr>,
+        _filter: Arc<C::TriggerFilter>,
+    ) -> anyhow::Result<Box<dyn BlockStream<C>>> {
+        unimplemented!();
+    }
+
     async fn build_polling(
         &self,
         _chain: &C,
@@ -590,6 +620,18 @@ impl<C: Blockchain> BlockStreamBuilder<C> for StaticStreamBuilder<C>
 where
     C::TriggerData: Clone,
 {
+    async fn build_substreams(
+        &self,
+        _chain: &C,
+        _schema: Arc<InputSchema>,
+        _deployment: DeploymentLocator,
+        _block_cursor: FirehoseCursor,
+        _subgraph_current_block: Option<BlockPtr>,
+        _filter: Arc<C::TriggerFilter>,
+    ) -> anyhow::Result<Box<dyn BlockStream<C>>> {
+        unimplemented!()
+    }
+
     async fn build_firehose(
         &self,
         _chain: &C,
@@ -630,7 +672,11 @@ struct StaticStream<C: Blockchain> {
     stream: Pin<Box<dyn Stream<Item = Result<BlockStreamEvent<C>, Error>> + Send>>,
 }
 
-impl<C: Blockchain> BlockStream<C> for StaticStream<C> {}
+impl<C: Blockchain> BlockStream<C> for StaticStream<C> {
+    fn buffer_size_hint(&self) -> usize {
+        1
+    }
+}
 
 impl<C: Blockchain> Stream for StaticStream<C> {
     type Item = Result<BlockStreamEvent<C>, Error>;

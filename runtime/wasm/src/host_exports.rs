@@ -4,7 +4,9 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use graph::data::subgraph::API_VERSION_0_0_8;
 use graph::data::value::Word;
+
 use never::Never;
 use semver::Version;
 use wasmtime::Trap;
@@ -150,6 +152,54 @@ impl<C: Blockchain> HostExports<C> {
         )))
     }
 
+    fn check_invalid_fields(
+        &self,
+        api_version: Version,
+        data: &HashMap<Word, Value>,
+        state: &BlockState<C>,
+        entity_type: &EntityType,
+    ) -> Result<(), HostExportError> {
+        if api_version >= API_VERSION_0_0_8 {
+            let has_invalid_fields = data.iter().any(|(field_name, _)| {
+                !state
+                    .entity_cache
+                    .schema
+                    .has_field_with_name(entity_type, &field_name)
+            });
+
+            if has_invalid_fields {
+                let mut invalid_fields: Vec<Word> = data
+                    .iter()
+                    .filter_map(|(field_name, _)| {
+                        if !state
+                            .entity_cache
+                            .schema
+                            .has_field_with_name(entity_type, &field_name)
+                        {
+                            Some(field_name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                invalid_fields.sort();
+
+                return Err(HostExportError::Deterministic(anyhow!(
+                    "Attempted to set undefined fields [{}] for the entity type `{}`. Make sure those fields are defined in the schema.",
+                    invalid_fields
+                        .iter()
+                        .map(|f| f.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    entity_type
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn store_set(
         &self,
         logger: &Logger,
@@ -161,28 +211,6 @@ impl<C: Blockchain> HostExports<C> {
         stopwatch: &StopwatchMetrics,
         gas: &GasCounter,
     ) -> Result<(), HostExportError> {
-        let poi_section = stopwatch.start_section("host_export_store_set__proof_of_indexing");
-        write_poi_event(
-            proof_of_indexing,
-            &ProofOfIndexingEvent::SetEntity {
-                entity_type: &entity_type,
-                id: &entity_id,
-                data: &data,
-            },
-            &self.poi_causality_region,
-            logger,
-        );
-        poi_section.end();
-
-        let key = EntityKey {
-            entity_type: EntityType::new(entity_type),
-            entity_id: entity_id.into(),
-            causality_region: self.data_source_causality_region,
-        };
-        self.check_entity_type_access(&key.entity_type)?;
-
-        gas.consume_host_fn(gas::STORE_SET.with_args(complexity::Linear, (&key, &data)))?;
-
         fn check_id(key: &EntityKey, prev_id: &str) -> Result<(), anyhow::Error> {
             if prev_id != key.entity_id.as_str() {
                 Err(anyhow!(
@@ -196,6 +224,15 @@ impl<C: Blockchain> HostExports<C> {
                 Ok(())
             }
         }
+
+        let key = EntityKey {
+            entity_type: EntityType::new(entity_type),
+            entity_id: entity_id.into(),
+            causality_region: self.data_source_causality_region,
+        };
+        self.check_entity_type_access(&key.entity_type)?;
+
+        gas.consume_host_fn(gas::STORE_SET.with_args(complexity::Linear, (&key, &data)))?;
 
         // Set the id if there isn't one yet, and make sure that a
         // previously set id agrees with the one in the `key`
@@ -211,9 +248,33 @@ impl<C: Blockchain> HostExports<C> {
             }
         }
 
+        self.check_invalid_fields(self.api_version.clone(), &data, state, &key.entity_type)?;
+
+        // Filter out fields that are not in the schema
+        let filtered_entity_data = data.into_iter().filter(|(field_name, _)| {
+            state
+                .entity_cache
+                .schema
+                .has_field_with_name(&key.entity_type, field_name)
+        });
+
         let entity = state
             .entity_cache
-            .make_entity(data.into_iter().map(|(key, value)| (key, value)))?;
+            .make_entity(filtered_entity_data)
+            .map_err(|e| HostExportError::Deterministic(anyhow!(e)))?;
+
+        let poi_section = stopwatch.start_section("host_export_store_set__proof_of_indexing");
+        write_poi_event(
+            proof_of_indexing,
+            &ProofOfIndexingEvent::SetEntity {
+                entity_type: &key.entity_type.as_str(),
+                id: &key.entity_id.as_str(),
+                data: &entity,
+            },
+            &self.poi_causality_region,
+            logger,
+        );
+        poi_section.end();
 
         state.entity_cache.set(key, entity)?;
 

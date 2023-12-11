@@ -14,7 +14,7 @@ use diesel::Connection;
 
 use graph::components::store::write::WriteChunk;
 use graph::components::store::{DerivedEntityQuery, EntityKey};
-use graph::data::store::NULL;
+use graph::data::store::{NULL, PARENT_ID};
 use graph::data::value::{Object, Word};
 use graph::data_source::CausalityRegion;
 use graph::prelude::{
@@ -540,7 +540,7 @@ impl EntityData {
                     // Simply ignore keys that do not have an underlying table
                     // column; those will be things like the block_range that
                     // is used internally for versioning
-                    if key == "g$parent_id" {
+                    if key == PARENT_ID.as_str() {
                         if T::WITH_INTERNAL_KEYS {
                             match &parent_type {
                                 None => {
@@ -553,7 +553,7 @@ impl EntityData {
                                 }
                                 Some(parent_type) => Some(
                                     T::Value::from_column_value(parent_type, json)
-                                        .map(|value| (Word::from("g$parent_id"), value)),
+                                        .map(|value| (PARENT_ID.clone(), value)),
                                 ),
                             }
                         } else {
@@ -973,8 +973,9 @@ impl<'a> QueryFilter<'a> {
             }
             Child(child) => {
                 if child_filter_ancestor {
-                    return Err(StoreError::QueryExecutionError(
-                        "Child filters can not be nested".to_string(),
+                    return Err(StoreError::ChildFilterNestingNotSupportedError(
+                        child.attr.to_string(),
+                        filter.to_string(),
                     ));
                 }
 
@@ -1812,10 +1813,9 @@ struct FulltextValues<'a>(HashMap<&'a Word, Vec<(&'a str, Value)>>);
 
 impl<'a> FulltextValues<'a> {
     fn new(table: &'a Table, rows: &'a WriteChunk<'a>) -> Self {
-        let mut map = HashMap::new();
+        let mut map: HashMap<&Word, Vec<(&str, Value)>> = HashMap::new();
         for column in table.columns.iter().filter(|column| column.is_fulltext()) {
             for row in rows {
-                let mut fulltext = Vec::new();
                 if let Some(fields) = column.fulltext_fields.as_ref() {
                     let fulltext_field_values = fields
                         .iter()
@@ -1823,11 +1823,10 @@ impl<'a> FulltextValues<'a> {
                         .cloned()
                         .collect::<Vec<Value>>();
                     if !fulltext_field_values.is_empty() {
-                        fulltext.push((column.field.as_str(), Value::List(fulltext_field_values)));
+                        map.entry(row.id)
+                            .or_default()
+                            .push((column.field.as_str(), Value::List(fulltext_field_values)));
                     }
-                }
-                if !fulltext.is_empty() {
-                    map.insert(row.id, fulltext);
                 }
             }
         }
@@ -2551,7 +2550,8 @@ impl<'a> FilterWindow<'a> {
     ) -> QueryResult<()> {
         out.push_sql("select '");
         out.push_sql(self.table.object.as_str());
-        out.push_sql("' as entity, c.id, c.vid, p.id::text as g$parent_id");
+        out.push_sql("' as entity, c.id, c.vid, p.id::text as ");
+        out.push_sql(&*PARENT_ID);
         sort_key.select(&mut out, SelectStatementLevel::InnerStatement)?;
         self.children(ParentLimit::Outer, block, out)
     }
@@ -3511,14 +3511,20 @@ impl<'a> SortKey<'a> {
     /// A boolean (use_sort_key_alias) is not a good idea and prone to errors.
     /// We could make it the standard and always use sort_key$ alias.
     fn order_by_parent(&self, out: &mut AstPass<Pg>, use_sort_key_alias: bool) -> QueryResult<()> {
+        fn order_by_parent_id(out: &mut AstPass<Pg>) {
+            out.push_sql("order by ");
+            out.push_sql(&*PARENT_ID);
+            out.push_sql(", ");
+        }
+
         match self {
             SortKey::None => Ok(()),
             SortKey::IdAsc(_) => {
-                out.push_sql("order by g$parent_id, ");
+                order_by_parent_id(out);
                 out.push_identifier(PRIMARY_KEY_COLUMN)
             }
             SortKey::IdDesc(_) => {
-                out.push_sql("order by g$parent_id, ");
+                order_by_parent_id(out);
                 out.push_identifier(PRIMARY_KEY_COLUMN)?;
                 out.push_sql(" desc");
                 Ok(())
@@ -3528,7 +3534,7 @@ impl<'a> SortKey<'a> {
                 value,
                 direction,
             } => {
-                out.push_sql("order by g$parent_id, ");
+                order_by_parent_id(out);
                 SortKey::sort_expr(
                     column,
                     value,
@@ -3982,7 +3988,8 @@ impl<'a> FilterQuery<'a> {
     ) -> QueryResult<()> {
         Self::select_entity_and_data(window.table, &mut out);
         out.push_sql(" from (\n");
-        out.push_sql("select c.*, p.id::text as g$parent_id");
+        out.push_sql("select c.*, p.id::text as ");
+        out.push_sql(&*PARENT_ID);
         window.children(
             ParentLimit::Ranked(&self.sort_key, &self.range),
             self.block,

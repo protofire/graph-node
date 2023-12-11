@@ -7,7 +7,9 @@ use std::time::Duration;
 use assert_json_diff::assert_json_eq;
 use graph::blockchain::block_stream::BlockWithTriggers;
 use graph::blockchain::{Block, BlockPtr, Blockchain};
+use graph::data::store::scalar::Bytes;
 use graph::data::subgraph::schema::{SubgraphError, SubgraphHealth};
+use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
 use graph::env::EnvVars;
 use graph::ipfs_client::IpfsClient;
@@ -16,7 +18,10 @@ use graph::prelude::ethabi::ethereum_types::H256;
 use graph::prelude::{
     CheapClone, DeploymentHash, SubgraphAssignmentProvider, SubgraphName, SubgraphStore,
 };
-use graph_tests::fixture::ethereum::{chain, empty_block, genesis, push_test_log};
+use graph_tests::fixture::ethereum::{
+    chain, empty_block, generate_empty_blocks_for_range, genesis, push_test_log,
+    push_test_polling_trigger,
+};
 use graph_tests::fixture::{
     self, stores, test_ptr, test_ptr_reorged, MockAdapterSelector, NoopAdapterSelector, Stores,
 };
@@ -36,7 +41,24 @@ impl RunnerTestRecipe {
 
         let (stores, hash) = tokio::join!(
             stores("./runner-tests/config.simple.toml"),
-            build_subgraph(&test_dir)
+            build_subgraph(&test_dir, None)
+        );
+
+        Self {
+            stores,
+            subgraph_name,
+            hash,
+        }
+    }
+
+    /// Builds a new test subgraph with a custom deploy command.
+    async fn new_with_custom_cmd(subgraph_name: &str, deploy_cmd: &str) -> Self {
+        let subgraph_name = SubgraphName::new(subgraph_name).unwrap();
+        let test_dir = format!("./runner-tests/{}", subgraph_name);
+
+        let (stores, hash) = tokio::join!(
+            stores("./runner-tests/config.simple.toml"),
+            build_subgraph(&test_dir, Some(deploy_cmd))
         );
 
         Self {
@@ -143,6 +165,80 @@ async fn typename() -> anyhow::Result<()> {
     ctx.start_and_sync_to(stop_block).await;
 
     Ok(())
+}
+
+#[tokio::test]
+async fn api_version_0_0_7() {
+    let RunnerTestRecipe {
+        stores,
+        subgraph_name,
+        hash,
+    } = RunnerTestRecipe::new_with_custom_cmd("api-version", "deploy:test-0-0-7").await;
+
+    // Before apiVersion 0.0.8 we allowed setting fields not defined in the schema.
+    // This test tests that it is still possible for lower apiVersion subgraphs
+    // to set fields not defined in the schema.
+
+    let blocks = {
+        let block_0 = genesis();
+        let mut block_1 = empty_block(block_0.ptr(), test_ptr(1));
+        push_test_log(&mut block_1, "0.0.7");
+        vec![block_0, block_1]
+    };
+
+    let stop_block = blocks.last().unwrap().block.ptr();
+
+    let chain = chain(blocks, &stores, None).await;
+    let ctx = fixture::setup(subgraph_name.clone(), &hash, &stores, &chain, None, None).await;
+
+    ctx.start_and_sync_to(stop_block).await;
+
+    let query_res = ctx
+        .query(&format!(r#"{{ testResults{{ id, message }} }}"#,))
+        .await
+        .unwrap();
+
+    assert_json_eq!(
+        query_res,
+        Some(object! {
+            testResults: vec![
+                object! { id: "0.0.7", message: "0.0.7" },
+            ]
+        })
+    );
+}
+
+#[tokio::test]
+async fn api_version_0_0_8() {
+    let RunnerTestRecipe {
+        stores,
+        subgraph_name,
+        hash,
+    } = RunnerTestRecipe::new_with_custom_cmd("api-version", "deploy:test-0-0-8").await;
+
+    // From apiVersion 0.0.8 we disallow setting fields not defined in the schema.
+    // This test tests that it is not possible to set fields not defined in the schema.
+
+    let blocks = {
+        let block_0 = genesis();
+        let mut block_1 = empty_block(block_0.ptr(), test_ptr(1));
+        push_test_log(&mut block_1, "0.0.8");
+        vec![block_0, block_1]
+    };
+
+    let chain = chain(blocks.clone(), &stores, None).await;
+    let ctx = fixture::setup(subgraph_name.clone(), &hash, &stores, &chain, None, None).await;
+    let stop_block = blocks.last().unwrap().block.ptr();
+    let err = ctx.start_and_sync_to_error(stop_block.clone()).await;
+    let message = "transaction 0000000000000000000000000000000000000000000000000000000000000000: Attempted to set undefined fields [invalid_field] for the entity type `TestResult`. Make sure those fields are defined in the schema.\twasm backtrace:\t    0: 0x2ebc - <unknown>!src/mapping/handleTestEvent\t in handler `handleTestEvent` at block #1 (0000000000000000000000000000000000000000000000000000000000000001)".to_string();
+    let expected_err = SubgraphError {
+        subgraph_id: ctx.deployment.hash.clone(),
+        message,
+        block_ptr: Some(stop_block),
+        handler: None,
+        deterministic: true,
+    };
+    assert_eq!(err, expected_err);
 }
 
 #[tokio::test]
@@ -510,6 +606,141 @@ async fn file_data_sources() {
 }
 
 #[tokio::test]
+async fn block_handlers() {
+    let RunnerTestRecipe {
+        stores,
+        subgraph_name,
+        hash,
+    } = RunnerTestRecipe::new("block-handlers").await;
+
+    let blocks = {
+        let block_0 = genesis();
+        let block_1_to_3 = generate_empty_blocks_for_range(block_0.ptr(), 1, 3);
+        let block_4 = {
+            let mut block = empty_block(block_1_to_3.last().unwrap().ptr(), test_ptr(4));
+            push_test_polling_trigger(&mut block);
+            push_test_log(&mut block, "create_template");
+            block
+        };
+        let block_5 = {
+            let mut block = empty_block(block_4.ptr(), test_ptr(5));
+            push_test_polling_trigger(&mut block);
+            block
+        };
+        let block_6 = {
+            let mut block = empty_block(block_5.ptr(), test_ptr(6));
+            push_test_polling_trigger(&mut block);
+            block
+        };
+        let block_7 = {
+            let mut block = empty_block(block_6.ptr(), test_ptr(7));
+            push_test_polling_trigger(&mut block);
+            block
+        };
+        let block_8 = {
+            let mut block = empty_block(block_7.ptr(), test_ptr(8));
+            push_test_polling_trigger(&mut block);
+            block
+        };
+        let block_9 = {
+            let mut block = empty_block(block_8.ptr(), test_ptr(9));
+            push_test_polling_trigger(&mut block);
+            block
+        };
+        let block_10 = {
+            let mut block = empty_block(block_9.ptr(), test_ptr(10));
+            push_test_polling_trigger(&mut block);
+            block
+        };
+
+        // return the blocks
+        vec![block_0]
+            .into_iter()
+            .chain(block_1_to_3)
+            .chain(vec![
+                block_4, block_5, block_6, block_7, block_8, block_9, block_10,
+            ])
+            .collect()
+    };
+
+    let chain = chain(blocks, &stores, None).await;
+
+    let mut env_vars = EnvVars::default();
+    env_vars.experimental_static_filters = true;
+
+    let ctx = fixture::setup(
+        subgraph_name.clone(),
+        &hash,
+        &stores,
+        &chain,
+        None,
+        Some(env_vars),
+    )
+    .await;
+
+    ctx.start_and_sync_to(test_ptr(10)).await;
+
+    let query = format!(
+        r#"{{ blockFromPollingHandlers(first: {first}) {{ id, hash }} }}"#,
+        first = 3
+    );
+    let query_res = ctx.query(&query).await.unwrap();
+
+    assert_eq!(
+        query_res,
+        Some(object! {
+            blockFromPollingHandlers: vec![
+                object! {
+                    id: test_ptr(0).number.to_string(),
+                    hash:format!("0x{}",test_ptr(0).hash_hex()) ,
+                },
+                object! {
+                id: test_ptr(4).number.to_string(),
+                hash:format!("0x{}",test_ptr(4).hash_hex()) ,
+                },
+                object! {
+                    id: test_ptr(8).number.to_string(),
+                    hash:format!("0x{}",test_ptr(8).hash_hex()) ,
+                },
+            ]
+        })
+    );
+
+    let query = format!(
+        r#"{{ blockFromOtherPollingHandlers(first: {first}, orderBy: number) {{ id, hash }} }}"#,
+        first = 4
+    );
+    let query_res = ctx.query(&query).await.unwrap();
+
+    assert_eq!(
+        query_res,
+        Some(object! {
+            blockFromOtherPollingHandlers: vec![
+                // TODO: The block in which the handler was created is not included
+                // in the result. This is because for runner tests we mock the triggers_adapter
+                // A mock triggers adapter which can be used here is to be implemented
+                // object! {
+                //     id: test_ptr(4).number.to_string(),
+                //     hash:format!("0x{}",test_ptr(10).hash_hex()) ,
+                // },
+                object!{
+                    id: test_ptr(6).number.to_string(),
+                    hash:format!("0x{}",test_ptr(6).hash_hex()) ,
+                },
+                object!{
+                    id: test_ptr(8).number.to_string(),
+                    hash:format!("0x{}",test_ptr(8).hash_hex()) ,
+                },
+                object!{
+                    id: test_ptr(10).number.to_string(),
+                    hash:format!("0x{}",test_ptr(10).hash_hex()) ,
+                },
+            ]
+        })
+    );
+}
+
+#[tokio::test]
 async fn template_static_filters_false_positives() {
     let RunnerTestRecipe {
         stores,
@@ -557,6 +788,37 @@ async fn template_static_filters_false_positives() {
             253, 249, 50, 171, 127, 117, 77, 13, 79, 132, 88, 246, 223, 214, 225, 39, 112, 19, 73,
             97, 193, 132, 103, 19, 191, 5, 28, 14, 232, 137, 76, 9
         ],
+    );
+}
+
+#[tokio::test]
+async fn parse_data_source_context() {
+    let RunnerTestRecipe {
+        stores,
+        subgraph_name,
+        hash,
+    } = RunnerTestRecipe::new("data-sources").await;
+
+    let blocks = {
+        let block_0 = genesis();
+        let block_1 = empty_block(block_0.ptr(), test_ptr(1));
+        let block_2 = empty_block(block_1.ptr(), test_ptr(2));
+        vec![block_0, block_1, block_2]
+    };
+    let stop_block = blocks.last().unwrap().block.ptr();
+    let chain = chain(blocks, &stores, None).await;
+
+    let ctx = fixture::setup(subgraph_name.clone(), &hash, &stores, &chain, None, None).await;
+    ctx.start_and_sync_to(stop_block).await;
+
+    let query_res = ctx
+        .query(r#"{ data(id: "0") { id, foo, bar } }"#)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        query_res,
+        Some(object! { data: object!{ id: "0", foo: "test", bar: 1 } })
     );
 }
 
@@ -663,6 +925,65 @@ async fn fatal_error() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn arweave_file_data_sources() {
+    let RunnerTestRecipe {
+        stores,
+        subgraph_name,
+        hash,
+    } = RunnerTestRecipe::new("arweave-file-data-sources").await;
+
+    let blocks = {
+        let block_0 = genesis();
+        let block_1 = empty_block(block_0.ptr(), test_ptr(1));
+        let block_2 = empty_block(block_1.ptr(), test_ptr(2));
+        vec![block_0, block_1, block_2]
+    };
+
+    // HASH used in the mappings.
+    let id = "8APeQ5lW0-csTcBaGdPBDLAL2ci2AT9pTn2tppGPU_8";
+
+    // This test assumes the file data sources will be processed in the same block in which they are
+    // created. But the test might fail due to a race condition if for some reason it takes longer
+    // than expected to fetch the file from arweave. The sleep here will conveniently happen after the
+    // data source is added to the offchain monitor but before the monitor is checked, in an an
+    // attempt to ensure the monitor has enough time to fetch the file.
+    let adapter_selector = NoopAdapterSelector {
+        x: PhantomData,
+        triggers_in_block_sleep: Duration::from_millis(1500),
+    };
+    let chain = chain(blocks.clone(), &stores, Some(Arc::new(adapter_selector))).await;
+    let ctx = fixture::setup(subgraph_name.clone(), &hash, &stores, &chain, None, None).await;
+    ctx.start_and_sync_to(test_ptr(2)).await;
+
+    let store = ctx.store.cheap_clone();
+    let writable = store
+        .writable(ctx.logger.clone(), ctx.deployment.id, Arc::new(Vec::new()))
+        .await
+        .unwrap();
+    let datasources = writable.load_dynamic_data_sources(vec![]).await.unwrap();
+    assert_eq!(datasources.len(), 1);
+    let ds = datasources.first().unwrap();
+    assert_ne!(ds.causality_region, CausalityRegion::ONCHAIN);
+    assert_eq!(ds.done_at.is_some(), true);
+    assert_eq!(
+        ds.param.as_ref().unwrap(),
+        &Bytes::from(Word::from(id).as_bytes())
+    );
+
+    let content_bytes = ctx.arweave_resolver.get(&Word::from(id)).await.unwrap();
+    let content = String::from_utf8(content_bytes.into()).unwrap();
+    let query_res = ctx
+        .query(&format!(r#"{{ file(id: "{id}") {{ id, content }} }}"#,))
+        .await
+        .unwrap();
+
+    assert_json_eq!(
+        query_res,
+        Some(object! { file: object!{ id: id, content: content.clone() } })
+    );
+}
+
+#[tokio::test]
 async fn poi_for_deterministically_failed_sg() -> anyhow::Result<()> {
     let RunnerTestRecipe {
         stores,
@@ -724,8 +1045,11 @@ async fn poi_for_deterministically_failed_sg() -> anyhow::Result<()> {
 
     Ok(())
 }
-async fn build_subgraph(dir: &str) -> DeploymentHash {
-    build_subgraph_with_yarn_cmd(dir, "deploy:test").await
+
+/// deploy_cmd is the command to run to deploy the subgraph. If it is None, the
+/// default `yarn deploy:test` is used.
+async fn build_subgraph(dir: &str, deploy_cmd: Option<&str>) -> DeploymentHash {
+    build_subgraph_with_yarn_cmd(dir, deploy_cmd.unwrap_or("deploy:test")).await
 }
 
 async fn build_subgraph_with_yarn_cmd(dir: &str, yarn_cmd: &str) -> DeploymentHash {

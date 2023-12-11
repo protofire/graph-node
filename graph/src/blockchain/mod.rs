@@ -18,7 +18,7 @@ mod types;
 use crate::{
     cheap_clone::CheapClone,
     components::store::{DeploymentCursorTracker, DeploymentLocator, StoredDynamicDataSource},
-    data::subgraph::UnifiedMappingApiVersion,
+    data::subgraph::{UnifiedMappingApiVersion, MIN_SPEC_VERSION},
     data_source,
     prelude::DataSourceContext,
     runtime::{gas::GasCounter, AscHeap, HostExportError},
@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use slog::Logger;
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{self, Debug},
     str::FromStr,
     sync::Arc,
@@ -135,15 +135,6 @@ impl ChainStoreBlock {
         i64::from_str_radix(&self.timestamp[i..], rdx).unwrap_or(0)
     }
 }
-
-// // ChainClient represents the type of client used to ingest data from the chain. For most chains
-// // this will be either firehose or some sort of rpc client.
-// // If a specific chain requires more than one adapter this should be handled by the chain specifically
-// // as it's not common behavior across chains.
-// pub enum ChainClient<C: Blockchain> {
-//     Firehose(FirehoseEndpoints),
-//     Rpc(C::Client),
-// }
 
 #[async_trait]
 // This is only `Debug` because some tests require that
@@ -270,7 +261,12 @@ pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
     fn context(&self) -> Arc<Option<DataSourceContext>>;
     fn creation_block(&self) -> Option<BlockNumber>;
     fn api_version(&self) -> semver::Version;
+    fn min_spec_version(&self) -> semver::Version {
+        MIN_SPEC_VERSION
+    }
     fn runtime(&self) -> Option<Arc<Vec<u8>>>;
+
+    fn handler_kinds(&self) -> HashSet<&str>;
 
     /// Checks if `trigger` matches this data source, and if so decodes it into a `MappingTrigger`.
     /// A return of `Ok(None)` mean the trigger does not match.

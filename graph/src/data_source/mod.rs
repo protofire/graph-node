@@ -22,7 +22,11 @@ use anyhow::Error;
 use semver::Version;
 use serde::{de::IntoDeserializer as _, Deserialize, Deserializer};
 use slog::{Logger, SendSyncRefUnwindSafeKV};
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -107,10 +111,17 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> String {
         match self {
-            Self::Onchain(ds) => ds.kind(),
-            Self::Offchain(ds) => &ds.kind,
+            Self::Onchain(ds) => ds.kind().to_owned(),
+            Self::Offchain(ds) => ds.kind.to_string(),
+        }
+    }
+
+    pub fn min_spec_version(&self) -> Version {
+        match self {
+            Self::Onchain(ds) => ds.min_spec_version(),
+            Self::Offchain(ds) => ds.min_spec_version(),
         }
     }
 
@@ -148,6 +159,13 @@ impl<C: Blockchain> DataSource<C> {
             // been enforced.
             Self::Onchain(_) => EntityTypeAccess::Any,
             Self::Offchain(ds) => EntityTypeAccess::Restriced(ds.mapping.entities.clone()),
+        }
+    }
+
+    pub fn handler_kinds(&self) -> HashSet<&str> {
+        match self {
+            Self::Onchain(ds) => ds.handler_kinds(),
+            Self::Offchain(ds) => vec![ds.handler_kind()].into_iter().collect(),
         }
     }
 
@@ -302,7 +320,7 @@ impl<C: Blockchain> DataSourceTemplate<C> {
     pub fn kind(&self) -> String {
         match self {
             Self::Onchain(ds) => ds.kind().to_string(),
-            Self::Offchain(ds) => ds.kind.to_owned(),
+            Self::Offchain(ds) => ds.kind.to_string(),
         }
     }
 }
@@ -402,6 +420,7 @@ impl<T> TriggerWithHandler<T> {
     }
 }
 
+#[derive(Debug)]
 pub enum TriggerData<C: Blockchain> {
     Onchain(C::TriggerData),
     Offchain(offchain::TriggerData),
@@ -467,7 +486,7 @@ macro_rules! deserialize_data_source {
                     .ok_or(serde::de::Error::missing_field("kind"))?
                     .as_str()
                     .unwrap_or("?");
-                if OFFCHAIN_KINDS.contains(&kind) {
+                if OFFCHAIN_KINDS.contains_key(&kind) {
                     offchain::$t::deserialize(map.into_deserializer())
                         .map_err(serde::de::Error::custom)
                         .map($t::Offchain)

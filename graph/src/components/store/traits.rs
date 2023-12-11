@@ -249,6 +249,8 @@ impl<T: ?Sized + ReadStore> ReadStore for Arc<T> {
 }
 
 pub trait DeploymentCursorTracker: Sync + Send + 'static {
+    fn input_schema(&self) -> Arc<InputSchema>;
+
     /// Get a pointer to the most recently processed block in the subgraph.
     fn block_ptr(&self) -> Option<BlockPtr>;
 
@@ -265,6 +267,10 @@ impl<T: ?Sized + DeploymentCursorTracker> DeploymentCursorTracker for Arc<T> {
 
     fn firehose_cursor(&self) -> FirehoseCursor {
         (**self).firehose_cursor()
+    }
+
+    fn input_schema(&self) -> Arc<InputSchema> {
+        (**self).input_schema()
     }
 }
 
@@ -557,6 +563,13 @@ pub trait QueryStore: Send + Sync {
 
     /// A permit should be acquired before starting query execution.
     async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
+
+    /// Report the name of the shard in which the subgraph is stored. This
+    /// should only be used for reporting and monitoring
+    fn shard(&self) -> &str;
+
+    /// Return the deployment id that is queried by this `QueryStore`
+    fn deployment_id(&self) -> DeploymentId;
 }
 
 /// A view of the store that can provide information about the indexing status

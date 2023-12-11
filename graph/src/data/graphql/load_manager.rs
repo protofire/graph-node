@@ -7,46 +7,61 @@ use std::iter::FromIterator;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::components::metrics::{Counter, Gauge, MetricsRegistry};
-use crate::components::store::PoolWaitStats;
+use crate::components::metrics::{Counter, GaugeVec, MetricsRegistry};
+use crate::components::store::{DeploymentId, PoolWaitStats};
 use crate::data::graphql::shape_hash::shape_hash;
 use crate::data::query::{CacheStatus, QueryExecutionError};
 use crate::prelude::q;
-use crate::prelude::{async_trait, debug, info, o, warn, Logger, QueryLoadManager, ENV_VARS};
+use crate::prelude::{debug, info, o, warn, Logger, ENV_VARS};
 use crate::util::stats::MovingStats;
 
-struct QueryEffort {
-    inner: Arc<RwLock<QueryEffortInner>>,
+const SHARD_LABEL: [&str; 1] = ["shard"];
+
+#[derive(PartialEq, Eq, Hash, Debug)]
+struct QueryRef {
+    id: DeploymentId,
+    shape_hash: u64,
 }
 
-/// Track the effort for queries (identified by their ShapeHash) over a
-/// time window.
-struct QueryEffortInner {
-    window_size: Duration,
-    bin_size: Duration,
-    effort: HashMap<u64, MovingStats>,
+impl QueryRef {
+    fn new(id: DeploymentId, shape_hash: u64) -> Self {
+        QueryRef { id, shape_hash }
+    }
+}
+
+/// Statistics about the query effort for a single database shard
+struct ShardEffort {
+    inner: Arc<RwLock<ShardEffortInner>>,
+}
+
+/// Track the effort for queries (identified by their deployment id and
+/// shape hash) over a time window.
+struct ShardEffortInner {
+    effort: HashMap<QueryRef, MovingStats>,
     total: MovingStats,
 }
 
 /// Create a `QueryEffort` that uses the window and bin sizes configured in
 /// the environment
-impl Default for QueryEffort {
+impl Default for ShardEffort {
     fn default() -> Self {
         Self::new(ENV_VARS.load_window_size, ENV_VARS.load_bin_size)
     }
 }
 
-impl QueryEffort {
+impl ShardEffort {
     pub fn new(window_size: Duration, bin_size: Duration) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(QueryEffortInner::new(window_size, bin_size))),
+            inner: Arc::new(RwLock::new(ShardEffortInner::new(window_size, bin_size))),
         }
     }
 
-    pub fn add(&self, shape_hash: u64, duration: Duration, gauge: &Gauge) {
+    pub fn add(&self, shard: &str, qref: QueryRef, duration: Duration, gauge: &GaugeVec) {
         let mut inner = self.inner.write().unwrap();
-        inner.add(shape_hash, duration);
-        gauge.set(inner.total.average().unwrap_or(Duration::ZERO).as_millis() as f64);
+        inner.add(qref, duration);
+        gauge
+            .with_label_values(&[shard])
+            .set(inner.total.average().unwrap_or(Duration::ZERO).as_millis() as f64);
     }
 
     /// Return what we know right now about the effort for the query
@@ -54,30 +69,28 @@ impl QueryEffort {
     /// at all, return `ZERO_DURATION` as the total effort. If we have no
     /// data for the particular query, return `None` as the effort
     /// for the query
-    pub fn current_effort(&self, shape_hash: u64) -> (Option<Duration>, Duration) {
+    pub fn current_effort(&self, qref: &QueryRef) -> (Option<Duration>, Duration) {
         let inner = self.inner.read().unwrap();
         let total_effort = inner.total.duration();
-        let query_effort = inner.effort.get(&shape_hash).map(|stats| stats.duration());
+        let query_effort = inner.effort.get(qref).map(|stats| stats.duration());
         (query_effort, total_effort)
     }
 }
 
-impl QueryEffortInner {
+impl ShardEffortInner {
     fn new(window_size: Duration, bin_size: Duration) -> Self {
         Self {
-            window_size,
-            bin_size,
             effort: HashMap::default(),
             total: MovingStats::new(window_size, bin_size),
         }
     }
 
-    fn add(&mut self, shape_hash: u64, duration: Duration) {
-        let window_size = self.window_size;
-        let bin_size = self.bin_size;
+    fn add(&mut self, qref: QueryRef, duration: Duration) {
+        let window_size = self.total.window_size;
+        let bin_size = self.total.bin_size;
         let now = Instant::now();
         self.effort
-            .entry(shape_hash)
+            .entry(qref)
             .or_insert_with(|| MovingStats::new(window_size, bin_size))
             .add_at(now, duration);
         self.total.add_at(now, duration);
@@ -188,24 +201,28 @@ impl Decision {
 
 pub struct LoadManager {
     logger: Logger,
-    effort: QueryEffort,
+    effort: HashMap<String, ShardEffort>,
     /// List of query shapes that have been statically blocked through
-    /// configuration
+    /// configuration. We should really also include the deployment, but
+    /// that would require a change to the format of the file from which
+    /// these queries are read
     blocked_queries: HashSet<u64>,
     /// List of query shapes that have caused more than `JAIL_THRESHOLD`
     /// proportion of the work while the system was overloaded. Currently,
     /// there is no way for a query to get out of jail other than
     /// restarting the process
-    jailed_queries: RwLock<HashSet<u64>>,
-    kill_state: RwLock<KillState>,
-    effort_gauge: Box<Gauge>,
+    jailed_queries: RwLock<HashSet<QueryRef>>,
+    /// Per shard state of whether we are killing queries or not
+    kill_state: HashMap<String, RwLock<KillState>>,
+    effort_gauge: Box<GaugeVec>,
     query_counters: HashMap<CacheStatus, Counter>,
-    kill_rate_gauge: Box<Gauge>,
+    kill_rate_gauge: Box<GaugeVec>,
 }
 
 impl LoadManager {
     pub fn new(
         logger: &Logger,
+        shards: Vec<String>,
         blocked_queries: Vec<Arc<q::Document>>,
         registry: Arc<MetricsRegistry>,
     ) -> Self {
@@ -224,18 +241,19 @@ impl LoadManager {
         };
         info!(logger, "Creating LoadManager in {} mode", mode,);
 
+        let shard_label: Vec<_> = SHARD_LABEL.into_iter().map(String::from).collect();
         let effort_gauge = registry
-            .new_gauge(
+            .new_gauge_vec(
                 "query_effort_ms",
                 "Moving average of time spent running queries",
-                HashMap::new(),
+                shard_label.clone(),
             )
             .expect("failed to create `query_effort_ms` counter");
         let kill_rate_gauge = registry
-            .new_gauge(
+            .new_gauge_vec(
                 "query_kill_rate",
                 "The rate at which the load manager kills queries",
-                HashMap::new(),
+                shard_label,
             )
             .expect("failed to create `query_kill_rate` counter");
         let query_counters = CacheStatus::iter()
@@ -252,12 +270,24 @@ impl LoadManager {
             })
             .collect::<HashMap<_, _>>();
 
+        let effort = HashMap::from_iter(
+            shards
+                .iter()
+                .map(|shard| (shard.clone(), ShardEffort::default())),
+        );
+
+        let kill_state = HashMap::from_iter(
+            shards
+                .into_iter()
+                .map(|shard| (shard, RwLock::new(KillState::new()))),
+        );
+
         Self {
             logger,
-            effort: QueryEffort::default(),
+            effort,
             blocked_queries,
             jailed_queries: RwLock::new(HashSet::new()),
-            kill_state: RwLock::new(KillState::new()),
+            kill_state,
             effort_gauge,
             query_counters,
             kill_rate_gauge,
@@ -267,12 +297,22 @@ impl LoadManager {
     /// Record that we spent `duration` amount of work for the query
     /// `shape_hash`, where `cache_status` indicates whether the query
     /// was cached or had to actually run
-    pub fn record_work(&self, shape_hash: u64, duration: Duration, cache_status: CacheStatus) {
+    pub fn record_work(
+        &self,
+        shard: &str,
+        deployment: DeploymentId,
+        shape_hash: u64,
+        duration: Duration,
+        cache_status: CacheStatus,
+    ) {
         self.query_counters
             .get(&cache_status)
             .map(GenericCounter::inc);
         if !ENV_VARS.load_management_is_disabled() {
-            self.effort.add(shape_hash, duration, &self.effort_gauge);
+            let qref = QueryRef::new(deployment, shape_hash);
+            self.effort
+                .get(shard)
+                .map(|effort| effort.add(shard, qref, duration, &self.effort_gauge));
         }
     }
 
@@ -322,7 +362,14 @@ impl LoadManager {
     /// case, we also do not take any locks when asked to update statistics,
     /// or to check whether we are overloaded; these operations amount to
     /// noops.
-    pub fn decide(&self, wait_stats: &PoolWaitStats, shape_hash: u64, query: &str) -> Decision {
+    pub fn decide(
+        &self,
+        wait_stats: &PoolWaitStats,
+        shard: &str,
+        deployment: DeploymentId,
+        shape_hash: u64,
+        query: &str,
+    ) -> Decision {
         use Decision::*;
 
         if self.blocked_queries.contains(&shape_hash) {
@@ -332,7 +379,9 @@ impl LoadManager {
             return Proceed;
         }
 
-        if self.jailed_queries.read().unwrap().contains(&shape_hash) {
+        let qref = QueryRef::new(deployment, shape_hash);
+
+        if self.jailed_queries.read().unwrap().contains(&qref) {
             return if ENV_VARS.load_simulate {
                 Proceed
             } else {
@@ -341,12 +390,16 @@ impl LoadManager {
         }
 
         let (overloaded, wait_ms) = self.overloaded(wait_stats);
-        let (kill_rate, last_update) = self.kill_state();
+        let (kill_rate, last_update) = self.kill_state(shard);
         if !overloaded && kill_rate == 0.0 {
             return Proceed;
         }
 
-        let (query_effort, total_effort) = self.effort.current_effort(shape_hash);
+        let (query_effort, total_effort) = self
+            .effort
+            .get(shard)
+            .map(|effort| effort.current_effort(&qref))
+            .unwrap_or((None, Duration::ZERO));
         // When `total_effort` is `Duratino::ZERO`, we haven't done any work. All are
         // welcome
         if total_effort.is_zero() {
@@ -368,11 +421,12 @@ impl LoadManager {
                 // effort in an overload situation gets killed
                 warn!(self.logger, "Jailing query";
                 "query" => query,
+                "sgd" => format!("sgd{}", qref.id),
                 "wait_ms" => wait_ms.as_millis(),
                 "query_effort_ms" => query_effort,
                 "total_effort_ms" => total_effort,
                 "ratio" => format!("{:.4}", query_effort/total_effort));
-                self.jailed_queries.write().unwrap().insert(shape_hash);
+                self.jailed_queries.write().unwrap().insert(qref);
                 return if ENV_VARS.load_simulate {
                     Proceed
                 } else {
@@ -383,13 +437,14 @@ impl LoadManager {
 
         // Kill random queries in case we have no queries, or not enough queries
         // that cause at least 20% of the effort
-        let kill_rate = self.update_kill_rate(kill_rate, last_update, overloaded, wait_ms);
+        let kill_rate = self.update_kill_rate(shard, kill_rate, last_update, overloaded, wait_ms);
         let decline =
             thread_rng().gen_bool((kill_rate * query_effort / total_effort).min(1.0).max(0.0));
         if decline {
             if ENV_VARS.load_simulate {
                 debug!(self.logger, "Declining query";
                     "query" => query,
+                    "sgd" => format!("sgd{}", qref.id),
                     "wait_ms" => wait_ms.as_millis(),
                     "query_weight" => format!("{:.2}", query_effort / total_effort),
                     "kill_rate" => format!("{:.4}", kill_rate),
@@ -410,13 +465,14 @@ impl LoadManager {
         (overloaded, store_avg.unwrap_or(Duration::ZERO))
     }
 
-    fn kill_state(&self) -> (f64, Instant) {
-        let state = self.kill_state.read().unwrap();
+    fn kill_state(&self, shard: &str) -> (f64, Instant) {
+        let state = self.kill_state.get(shard).unwrap().read().unwrap();
         (state.kill_rate, state.last_update)
     }
 
     fn update_kill_rate(
         &self,
+        shard: &str,
         mut kill_rate: f64,
         last_update: Instant,
         overloaded: bool,
@@ -450,7 +506,7 @@ impl LoadManager {
                 kill_rate = (kill_rate - KILL_RATE_STEP_DOWN).max(0.0);
             }
             let event = {
-                let mut state = self.kill_state.write().unwrap();
+                let mut state = self.kill_state.get(shard).unwrap().write().unwrap();
                 state.kill_rate = kill_rate;
                 state.last_update = now;
                 state.log_event(now, kill_rate, overloaded)
@@ -486,19 +542,9 @@ impl LoadManager {
                 Skip => { /* do nothing */ }
             }
         }
-        self.kill_rate_gauge.set(kill_rate);
+        self.kill_rate_gauge
+            .with_label_values(&[shard])
+            .set(kill_rate);
         kill_rate
-    }
-}
-
-#[async_trait]
-impl QueryLoadManager for LoadManager {
-    fn record_work(&self, shape_hash: u64, duration: Duration, cache_status: CacheStatus) {
-        if let Some(counter) = self.query_counters.get(&cache_status) {
-            counter.inc()
-        }
-        if !ENV_VARS.load_management_is_disabled() {
-            self.effort.add(shape_hash, duration, &self.effort_gauge);
-        }
     }
 }

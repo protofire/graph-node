@@ -5,7 +5,7 @@ use graph::bail;
 use graph::endpoint::EndpointMetrics;
 use graph::log::logger_with_levels;
 use graph::prelude::{MetricsRegistry, BLOCK_NUMBER_MAX};
-use graph::{data::graphql::effort::LoadManager, prelude::chrono, prometheus::Registry};
+use graph::{data::graphql::load_manager::LoadManager, prelude::chrono, prometheus::Registry};
 use graph::{
     prelude::{
         anyhow::{self, Context as AnyhowContextTrait},
@@ -85,6 +85,14 @@ pub struct Opt {
         help = "HTTP addresses of IPFS nodes\n"
     )]
     pub ipfs: Vec<String>,
+    #[clap(
+        long,
+        value_name = "{HOST:PORT|URL}",
+        default_value = "https://arweave.net",
+        env = "GRAPH_NODE_ARWEAVE_URL",
+        help = "HTTP base URL for arweave gateway"
+    )]
+    pub arweave: String,
     #[clap(
         long,
         default_value = "3",
@@ -656,6 +664,10 @@ pub enum IndexCommand {
             possible_values = &["btree", "hash", "gist", "spgist", "gin", "brin"]
         )]
         method: String,
+
+        #[clap(long)]
+        /// Specifies a starting block number for creating a partial index.
+        after: Option<i32>,
     },
     /// Lists existing indexes for a given Entity
     List {
@@ -774,6 +786,7 @@ struct Context {
     node_id: NodeId,
     config: Cfg,
     ipfs_url: Vec<String>,
+    arweave_url: String,
     fork_base: Option<Url>,
     registry: Arc<MetricsRegistry>,
     pub prometheus_registry: Arc<Registry>,
@@ -785,6 +798,7 @@ impl Context {
         node_id: NodeId,
         config: Cfg,
         ipfs_url: Vec<String>,
+        arweave_url: String,
         fork_base: Option<Url>,
         version_label: Option<String>,
     ) -> Self {
@@ -812,6 +826,7 @@ impl Context {
             fork_base,
             registry,
             prometheus_registry,
+            arweave_url,
         }
     }
 
@@ -933,7 +948,7 @@ impl Context {
         let store = self.store();
 
         let subscription_manager = Arc::new(PanicSubscriptionManager);
-        let load_manager = Arc::new(LoadManager::new(&logger, vec![], registry.clone()));
+        let load_manager = Arc::new(LoadManager::new(&logger, vec![], vec![], registry.clone()));
 
         Arc::new(GraphQlRunner::new(
             &logger,
@@ -1041,6 +1056,7 @@ async fn main() -> anyhow::Result<()> {
         node,
         config,
         opt.ipfs,
+        opt.arweave,
         fork_base,
         version_label.clone(),
     );
@@ -1171,6 +1187,7 @@ async fn main() -> anyhow::Result<()> {
             let store_builder = ctx.store_builder().await;
             let job_name = version_label.clone();
             let ipfs_url = ctx.ipfs_url.clone();
+            let arweave_url = ctx.arweave_url.clone();
             let metrics_ctx = MetricsContext {
                 prometheus: ctx.prometheus_registry.clone(),
                 registry: registry.clone(),
@@ -1183,6 +1200,7 @@ async fn main() -> anyhow::Result<()> {
                 store_builder,
                 network_name,
                 ipfs_url,
+                arweave_url,
                 config,
                 metrics_ctx,
                 node_id,
@@ -1391,6 +1409,7 @@ async fn main() -> anyhow::Result<()> {
                     entity,
                     fields,
                     method,
+                    after,
                 } => {
                     commands::index::create(
                         subgraph_store,
@@ -1399,6 +1418,7 @@ async fn main() -> anyhow::Result<()> {
                         &entity,
                         fields,
                         method,
+                        after,
                     )
                     .await
                 }

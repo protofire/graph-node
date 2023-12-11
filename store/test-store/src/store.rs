@@ -1,6 +1,6 @@
 use diesel::{self, PgConnection};
 use graph::blockchain::mock::MockDataSource;
-use graph::data::graphql::effort::LoadManager;
+use graph::data::graphql::load_manager::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
@@ -57,6 +57,7 @@ lazy_static! {
     pub static ref METRICS_REGISTRY: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     pub static ref LOAD_MANAGER: Arc<LoadManager> = Arc::new(LoadManager::new(
         &LOGGER,
+        CONFIG.stores.keys().cloned().collect(),
         Vec::new(),
         METRICS_REGISTRY.clone(),
     ));
@@ -536,7 +537,8 @@ async fn execute_subgraph_query_internal(
                 bc,
                 error_policy,
                 query.schema.id().clone(),
-                graphql_metrics()
+                graphql_metrics(),
+                LOAD_MANAGER.clone()
             )
             .await
         );
@@ -548,7 +550,6 @@ async fn execute_subgraph_query_internal(
                 QueryExecutionOptions {
                     resolver,
                     deadline,
-                    load_manager: LOAD_MANAGER.clone(),
                     max_first: std::u32::MAX,
                     max_skip: std::u32::MAX,
                     trace,
